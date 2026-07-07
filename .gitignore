@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+dcc_memory/
+test_memory/
+.env
+*.log
