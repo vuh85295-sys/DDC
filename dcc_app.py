@@ -120,7 +120,81 @@ def get_history(topic_id: str) -> list[dict]:
 # DCC Engine
 # ---------------------------------------------------------------------------
 ollama_client = OllamaClient()
-VI_INSTRUCT = "Tất cả câu trả lời phải viết bằng tiếng Việt có dấu, trừ code và thuật ngữ chuyên ngành."
+
+# KDM-style language contract templates
+LANG_CONTRACT_HEAD = """## KHẾ ƯỚC NGÔN NGỮ — BẮT BUỘC
+- Trả lời 100% bằng tiếng Việt có dấu, trừ code và thuật ngữ chuyên ngành.
+- Đúng: "Edge Computing — Xử lý dữ liệu gần nguồn..."
+- Sai: "Edge Computing is about processing data near the source..."
+"""
+
+LANG_CONTRACT_TAIL = """
+## NHẮC LẠI KHẾ ƯỚC NGÔN NGỮ
+- Trả lời bằng tiếng Việt có dấu (code/terms giữ nguyên gốc).
+- Output vi phạm sẽ bị phát hiện và từ chối.
+"""
+
+# Actor constitution — enforcement rules placed AFTER capsule (model primacy)
+ANTI_MAP_RULE = """⛔ 1. Yêu cầu trúng mục "Ngoài phạm vi (anti-map)" trong capsule → KHÔNG thiết kế, KHÔNG viết code.
+   Trả lời: nhắc mục anti-map + lý do nguyên văn, rồi hỏi:
+   "Muốn đưa vào phạm vi? Cập nhật bản đồ KDM trước."""
+
+RED_DECISION_RULE = """⛔ 2. Đề xuất thay đổi quyết định có mức Reversibility 🔴 → KHÔNG đồng ý, KHÔNG tự quyết.
+   Được phân tích trade-off, nhưng phải kết: quyết định chỉ mở lại khi user XÁC NHẬN
+   đã chạm Điểm chuyển đổi (switch_trigger) — trích nguyên văn từ capsule."""
+
+NO_FAKE_MEMORY_RULE = """⛔ 3. CẤM bịa trạng thái dự án khác current_state trong capsule.
+   CẤM tự sinh block [SYSTEM:...] hay tuyên bố "đã ghi vào bộ nhớ" — chỉ Compactor được ghi."""
+
+NO_CHEERLEAD_RULE = """⛔ 4. KHÔNG mở đầu bằng khen đề xuất ("hợp lý", "rất hay") trước khi đối chiếu hiến pháp."""
+
+
+def build_actor_system_prompt(capsule: MemoryCapsule) -> str:
+    """Build a constitution-enforcing system prompt from the capsule.
+    
+    Empty capsule → returns a plain chat prompt without constitution.
+    Active capsule → wraps capsule in HIẾN PHÁP THI HÀNH with enforcement rules.
+    """
+    # Detect empty capsule (cold start — no real project memory)
+    is_empty = (
+        not capsule.global_context.strip()
+        or capsule.global_context == "New topic. No prior history."
+    ) and len(capsule.key_decisions) == 0
+
+    if is_empty:
+        return (
+            f"{LANG_CONTRACT_HEAD}\n"
+            "Bạn là trợ lý AI thông thường. Hãy trò chuyện tự nhiên.\n"
+            f"{LANG_CONTRACT_TAIL}"
+        )
+
+    # Build capsule section
+    capsule_block = f"<capsule>\n{capsule.to_json()}\n</capsule>"
+
+    # Build enforcement rules (only include relevant ones)
+    rules = [ANTI_MAP_RULE, RED_DECISION_RULE, NO_FAKE_MEMORY_RULE, NO_CHEERLEAD_RULE]
+
+    rules_block = "\n\n".join(rules)
+
+    return f"""## HIẾN PHÁP DỰ ÁN — BẤT BIẾN
+
+Bạn là kiến trúc sư của dự án, vận hành DƯỚI hiến pháp bất biến dưới đây.
+Nhiệm vụ của bạn là BẢO VỆ các quyết định đã chốt, không phải chiều theo mọi đề xuất.
+
+---
+
+{capsule_block}
+
+---
+
+## LUẬT THI HÀNH
+
+{rules_block}
+
+---
+
+{LANG_CONTRACT_HEAD}
+{LANG_CONTRACT_TAIL}"""
 
 def _compact(capsule: MemoryCapsule, prompt: str, response: str, topic_id: str) -> MemoryCapsule:
     """Compactor dùng qwen2.5:7b-instruct (chính xác hơn 1.5b)."""
@@ -181,14 +255,8 @@ def dcc_chat(topic_id: str, prompt: str, provider_id: str, model: str,
     if capsule is None:
         capsule = MemoryCapsule.empty(topic_id)
 
-    # Build messages: capsule injection + tiếng Việt instruction
-    inject = f"""[SYSTEM: SYSTEMIC PROJECT MEMORY CACHE]
-You are a development partner with continuous episodic memory. Below is the ultra-dense status of the project/topic compiled from past historical frames:
----
-{capsule.to_json()}
----
-{VI_INSTRUCT}
-Execute the following prompt focusing strictly on this context."""
+    # Build messages: capsule injection + hiến pháp thi hành
+    inject = build_actor_system_prompt(capsule)
     messages = [
         {"role": "system", "content": inject},
         {"role": "user", "content": prompt},
