@@ -301,6 +301,56 @@ def get_capsule(topic_id: str):
     c = vault.get(topic_id)
     return {"capsule": json.loads(c.to_json()) if c else None}
 
+
+@app.post("/api/capsule/{topic_id}", status_code=201)
+def ingest_capsule(topic_id: str, capsule: MemoryCapsule):
+    """Ingest a capsule from external systems (KDM ecosystem).
+    
+    Validates topic_id format, checks for existing living memory,
+    then saves capsule as Turn 0.
+    """
+    # Validate topic_id format: 3-63 chars, lowercase ascii + digits + hyphens
+    if not re.match(r"^[a-z0-9-]{3,63}$", topic_id):
+        raise HTTPException(
+            422,
+            "topic_id must be 3-63 characters, lowercase ASCII letters, "
+            "digits, and hyphens only.",
+        )
+
+    from dcc_middleware import VectorVault
+    vault = VectorVault(DCC_PERSIST_DIR)
+
+    # Check existing living memory (frame > 0)
+    existing = vault.get(topic_id)
+    if existing and existing.metadata.last_updated_frame > 0:
+        raise HTTPException(
+            409,
+            f"Topic already has living memory (frame "
+            f"{existing.metadata.last_updated_frame}). Cannot overwrite. "
+            f"Use a different topic_id or delete the topic first.",
+        )
+
+    # Require global_context (not just empty default)
+    if not capsule.global_context.strip():
+        raise HTTPException(
+            422,
+            "global_context is required and cannot be empty.",
+        )
+
+    # Override topic field and reset frame to Turn 0
+    capsule.topic = topic_id
+    capsule.metadata.last_updated_frame = 0
+
+    # Embed and save
+    try:
+        emb = ollama_client.embed("nomic-embed-text", capsule.to_json())
+    except Exception:
+        emb = [0.0] * 16
+    vault.save(topic_id, capsule, emb)
+
+    return {"capsule": json.loads(capsule.to_json())}
+
+
 @app.get("/api/chat/{topic_id}")
 def get_topic_history(topic_id: str):
     return {"history": get_history(topic_id)}
