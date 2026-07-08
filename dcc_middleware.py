@@ -152,6 +152,8 @@ COMPACTOR_SYSTEM_PROMPT = """You are an advanced Memory Architect. Your sole job
 You must maintain 100% integrity, absolute conciseness, and zero noise (remove greetings, chit-chat, and discarded error logs).
 Update existing values if they changed. Add new decisions.
 
+DECISION SOURCE RULE — CRITICAL: Only record a new key_decision when the USER turn contains an explicit decision, confirmation, or approval. Do NOT record the assistant's own analysis, explanations, or suggestions as decisions. If the user only asked a question or the assistant explained something without the user deciding, key_decisions must NOT gain new entries.
+
 OUTPUT ONLY A VALID JSON OBJECT WITH THIS EXACT SCHEMA:
 {
   "topic": "String - Project/Topic Title",
@@ -260,6 +262,9 @@ class ContextCompactorMiddleware:
 
         # Step 5: Write zones enforcement
         capsule = self._enforce_write_zones(previous, capsule)
+        if capsule is None:
+            self._log("[Immune] 🔴 LOCKED decision violation — rejecting capsule")
+            return self._fail_safe_merge(previous, prompt)
 
         capsule.metadata.last_updated_frame = (
             previous.metadata.last_updated_frame + 1
@@ -282,13 +287,20 @@ class ContextCompactorMiddleware:
 
     @staticmethod
     def _enforce_write_zones(previous: MemoryCapsule,
-                             incoming: MemoryCapsule) -> MemoryCapsule:
+                             incoming: MemoryCapsule) -> Optional[MemoryCapsule]:
         """
         PHAN VUNG GHI (write zones):
         - LOCKED:   global_context — chi doi qua POST capsule tu KDM
+        - 🔴 LOCKED: decision chua 🔴 phai EXACT nhu cu (1 ky tu khac = reject)
         - GUARDED:  key_decisions — append-only, khong xoa/sua cu
         - FLUID:    current_state — tu do cap nhat
+        Tra ve None neu vi pham LOCKED 🔴 -> reject toan bo capsule.
         """
+        # 🔴 LOCKED: moi decision trong previous co 🔴 phai ton tai EXACT trong incoming
+        for old_dec in previous.key_decisions:
+            if '🔴' in old_dec and old_dec not in incoming.key_decisions:
+                return None  # signal: reject toan bo capsule
+
         # LOCKED: restore original global_context
         incoming.global_context = previous.global_context
 

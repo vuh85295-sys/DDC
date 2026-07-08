@@ -50,6 +50,27 @@ def test_has_cjk_korean_hanja():
     assert ContextCompactorMiddleware._has_cjk("韓國語") is True
 
 
+def test_has_cjk_cjk_punctuation_period():
+    """Dấu câu CJK: 。(U+3002) → True."""
+    assert ContextCompactorMiddleware._has_cjk("。") is True
+    assert ContextCompactorMiddleware._has_cjk("CJK。punctuation") is True
+
+
+def test_has_cjk_cjk_punctuation_comma():
+    """Dấu câu CJK: ，(U+FF0C) → True."""
+    assert ContextCompactorMiddleware._has_cjk("，") is True
+    assert ContextCompactorMiddleware._has_cjk("giữa，văn bản") is True
+
+
+def test_has_cjk_cjk_punctuation_all():
+    """Bộ dấu câu CJK chính → tất cả True."""
+    chars = "。、，．！？：；（）【】「」『』〃【】《》〈〉"
+    for ch in chars:
+        assert ContextCompactorMiddleware._has_cjk(ch), (
+            f"Expected CJK detection for U+{ord(ch):04X} {ch}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # _strip_system_blocks — SYSTEM block sanitizer
 # ---------------------------------------------------------------------------
@@ -191,3 +212,169 @@ def test_fail_safe_merge_preserves_decisions():
     assert "KHÔNG thanh toán" in result.global_context
     assert "auto-note" in result.current_state
     assert result.metadata.last_updated_frame == 6
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: 🔴 LOCKED exact compare — decision 🔴 lệch 1 ký tự = reject
+# ---------------------------------------------------------------------------
+
+def test_red_locked_decision_intact():
+    """🔴 decision trong incoming khớp EXACT với cũ → OK (trả về capsule)."""
+    old = _make_capsule(
+        global_context="Dự án parking",
+        key_decisions=["WebSockets (Reversibility: 🔴, Switch: 1M users)"],
+        current_state="Testing",
+        frame=2,
+    )
+    incoming = _make_capsule(
+        global_context="Dự án parking — sửa kiến trúc",
+        key_decisions=["WebSockets (Reversibility: 🔴, Switch: 1M users)"],
+        current_state="Testing tiếp",
+        frame=3,
+    )
+    result = ContextCompactorMiddleware._enforce_write_zones(old, incoming)
+    assert result is not None
+    assert "🔴" in result.key_decisions[0]
+
+
+def test_red_locked_decision_changed_one_char():
+    """🔴 decision lệch 1 ký tự → reject (trả về None)."""
+    old = _make_capsule(
+        global_context="Dự án parking — KHÔNG thanh toán.",
+        key_decisions=["Geohash sharding (Reversibility: 🔴, Switch: 50k)"],
+        current_state="Testing",
+        frame=3,
+    )
+    incoming = _make_capsule(
+        global_context="Dự án parking — đã bỏ sharding",  # bỊA
+        key_decisions=["Geohash sharding (Reversibility: 🔴, Switch: 500k)"],  # 50k → 500k, lệch 1 ký tự!
+        current_state="Đã bỏ sharding",
+        frame=4,
+    )
+    result = ContextCompactorMiddleware._enforce_write_zones(old, incoming)
+    assert result is None, (
+        f"Expected None (reject), got: {result.key_decisions if result else result}"
+    )
+
+
+def test_red_locked_decision_deleted():
+    """🔴 decision bị xoá khỏi incoming → reject."""
+    old = _make_capsule(
+        global_context="Dự án parking",
+        key_decisions=["PostGIS", "WebSockets (Reversibility: 🔴, Switch: 1M)"],
+        current_state="Active",
+        frame=2,
+    )
+    incoming = _make_capsule(
+        global_context="Dự án parking — bỏ WebSockets",  # bỊA
+        key_decisions=["PostGIS"],  # 🔴 decision bị mất!
+        current_state="Đã sửa",
+        frame=3,
+    )
+    result = ContextCompactorMiddleware._enforce_write_zones(old, incoming)
+    assert result is None
+
+
+def test_red_locked_multiple_decisions():
+    """Nhiều 🔴 decision — tất cả phải intact."""
+    old = _make_capsule(
+        global_context="Dự án",
+        key_decisions=[
+            "Payment (Reversibility: 🔴, Switch: legal OK)",
+            "Geohash (Reversibility: 🔴, Switch: 50k)",
+            "PostGIS (Reversibility: 🟡)",
+        ],
+        current_state="Active",
+        frame=5,
+    )
+    # incoming có decision nguy hiểm: đổi Geohash 🔴 threshold
+    bad_incoming = _make_capsule(
+        global_context="Dự án — thay đổi",
+        key_decisions=[
+            "Payment (Reversibility: 🔴, Switch: legal OK)",  # exact
+            "Geohash (Reversibility: 🔴, Switch: 100k)",  # THAY ĐỔI!
+            "PostGIS (Reversibility: 🟡)",  # 🟡 không bị LOCKED
+        ],
+        current_state="Thay đổi",
+        frame=6,
+    )
+    result = ContextCompactorMiddleware._enforce_write_zones(old, bad_incoming)
+    assert result is None, "🔴 Geohash changed threshold — should reject"
+
+    # incoming hoàn hảo → OK
+    good_incoming = _make_capsule(
+        global_context="Dự án — thêm feature",
+        key_decisions=[
+            "Payment (Reversibility: 🔴, Switch: legal OK)",
+            "Geohash (Reversibility: 🔴, Switch: 50k)",  # exact
+            "PostGIS (Reversibility: 🟡)",
+            "Redis caching (Reversibility: 🟡)",  # appended
+        ],
+        current_state="Thêm cache",
+        frame=6,
+    )
+    result2 = ContextCompactorMiddleware._enforce_write_zones(old, good_incoming)
+    assert result2 is not None
+    assert "Redis caching (Reversibility: 🟡)" in result2.key_decisions
+    assert len(result2.key_decisions) == 4  # 3 cũ + 1 mới
+
+
+# ---------------------------------------------------------------------------
+# Bug 3: Decision source filter — compactor prompt + functional test
+# ---------------------------------------------------------------------------
+
+def test_compactor_prompt_contains_source_rule():
+    """COMPACTOR_SYSTEM_PROMPT chứa DECISION SOURCE RULE."""
+    from dcc_middleware import COMPACTOR_SYSTEM_PROMPT
+    assert "DECISION SOURCE RULE" in COMPACTOR_SYSTEM_PROMPT
+    assert "USER turn" in COMPACTOR_SYSTEM_PROMPT
+    assert "explicit decision" in COMPACTOR_SYSTEM_PROMPT.lower()
+
+
+def test_decision_source_filter_no_new_from_explanation():
+    """
+    Q2 scenario: Actor giải thích database, user không quyết gì.
+    key_decisions KHÔNG được thêm mục mới.
+    """
+    import json
+    from dcc_middleware import ContextCompactorMiddleware, MemoryCapsule
+
+    class SourceMockClient:
+        def __init__(self):
+            self.call_count = 0
+        def embed(self, model, text):
+            return [0.0] * 16
+        def chat(self, model, messages, temperature=0.7, json_mode=False):
+            if json_mode:
+                # Compactor: không thêm decision mới (user chỉ hỏi, không quyết)
+                return json.dumps({
+                    "topic": "ParkingFinder",
+                    "global_context": "Realtime parking using PostGIS",
+                    "key_decisions": [],
+                    "current_state": "Explained database architecture to user",
+                    "metadata": {"last_updated_frame": 1, "token_efficiency_saved": "0%"},
+                })
+            # Actor response: giải thích database
+            return (
+                "PostGIS is a spatial extension for PostgreSQL. "
+                "We store parking spots with geometry(Point, 4326) "
+                "and index with GIST for fast radius queries."
+            )
+
+    client = SourceMockClient()
+    dcc = ContextCompactorMiddleware(client=client, persist_dir="./test_memory_v2")
+
+    old = MemoryCapsule(
+        topic="ParkingFinder",
+        global_context="Realtime parking finder using PostGIS",
+        key_decisions=["PostGIS làm database không gian"],
+        current_state="Active — kiểm thử hiệu năng",
+    )
+
+    # User chỉ hỏi "Explain database" — KHÔNG có quyết định gì
+    result = dcc._compact(old, "Explain the database setup please",
+                          "PostGIS is a spatial extension...")
+
+    # key_decisions không được thêm mục mới
+    assert len(result.key_decisions) == 1
+    assert result.key_decisions == ["PostGIS làm database không gian"]
