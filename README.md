@@ -135,3 +135,44 @@ MIT License — xem file [LICENSE](LICENSE).
 ---
 
 *Made with ❤️ by [Nguyễn Hiep](https://github.com/hanaruka-star)*
+
+---
+
+## 🏆 Sprint B — Ecosystem Verified (2026-07-09)
+
+Sprint B chứng minh **KDM → DCC ecosystem** vòng khép kín E2E:
+```
+Wish 2 dòng → KDM backward mapping → duyệt decision 🔴 → export capsule
+→ POST /api/capsule → Vault → Actor bị hiến pháp trói → Compactor miễn dịch
+→ ký ức tiến hóa không thoái hóa
+```
+
+### Tầng Actor: ✅ VERIFIED
+- Qwen 7B local: **5/5** (vòng 1 không hiến pháp: 3/5 + vỡ tiếng Trung)
+- Gemini 2.5 Pro: **4/4** (vòng 1 không hiến pháp: giả mạo [SYSTEM], tự quyết bỏ 🔴)
+
+### Immune System: 4 phiên bản (v1→v4) — 57 tests
+
+| v | Lớp bảo vệ | Mô tả |
+|---|-----------|-------|
+| v1 | Write zones | LOCKED/GUARDED/FLUID + fail-safe + strip [SYSTEM] blocks |
+| v2 | CJK net + 🔴 exact + source filter | Dấu câu CJK, decision 🔴 lệch 1 ký tự = reject, decision chỉ từ user |
+| v3 | Full lang net + negation guard + FLUID semantic | Quét parsed fields, giữ "KHÔNG" khi nén, current_state không mâu thuẫn LOCKED |
+| **v4** | **Bytes-frozen global_context** | KDM-seeded capsule: global_context bytes-equal — thêm/bớt/sửa 1 ký tự = reject |
+
+### Định luật Sprint B (experience_matrix)
+1. Capsule inject không luật thi hành = tài liệu tham khảo; model càng mạnh phá càng thuyết phục
+2. Hiến pháp phải trói CẢ kẻ nói (Actor) lẫn kẻ ghi (Compactor)
+3. Ký ức phải phân vùng ghi: FROZEN (bytes-equal) / GUARDED (append + source filter) / FLUID (có lính gác ngữ nghĩa)
+4. "Phép nén đánh rơi chữ KHÔNG" — nén lời từ chối phải giữ phủ định
+5. Chất độc luôn tìm vùng không gác: đảo (nói dối) → cộng (pha loãng) → vùng FLUID
+6. Validate-or-keep-old: ký ức cũ đúng hơn ký ức hỏng
+7. Rút quyền viết thắng thêm lính gác — vùng không cửa không cần khóa
+8. Bài test bẫy tự nó đầu độc ký ức — mọi lần thử lửa phải có tẩy độc + khám nghiệm hậu kỳ
+
+### Sổ nợ v1.2 (không blocker)
+- Compactor tự phong 🔴 — decision do Compactor sinh phải cap 🟡; 🔴 chỉ từ KDM hoặc user confirm
+- Rác turn thô trong current_state — strip pattern "(turn: ...)"
+- Ô "Lý do" bắt buộc decision + model đọc lại xác nhận
+- Topic slug ≤50 ký tự (verify bên KDM)
+- Learn Mode UI, kéo thả map tay, auth
