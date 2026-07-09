@@ -534,3 +534,99 @@ def test_locked_contradiction_multiple_rules():
     )
     result = ContextCompactorMiddleware._check_locked_contradiction(old, incoming)
     assert result is True, "Auth bị cấm nhưng current_state nói đã deploy"
+
+
+# ---------------------------------------------------------------------------
+# v4: Byte-frozen global_context for KDM-seeded capsules
+# ---------------------------------------------------------------------------
+
+def test_global_context_frozen_organic():
+    """Organic capsule (seeded_by_kdm=False) khong bi kiem tra → luon OK."""
+    old = MemoryCapsule(
+        topic="organic", global_context="Old context",
+        key_decisions=[], current_state="Active",
+    )
+    incoming = MemoryCapsule(
+        topic="organic", global_context="New context from compactor",
+        key_decisions=[], current_state="Updated",
+    )
+    result = ContextCompactorMiddleware._check_global_context_frozen(old, incoming)
+    assert result is False, "Organic capsule — must pass regardless"
+
+
+def test_global_context_frozen_seeded_identical():
+    """Seeded capsule, global_context bytes-equal → OK."""
+    ctx = "Dự án parking — KHÔNG làm thanh toán. Ngoài phạm vi: booking."
+    old = MemoryCapsule(
+        topic="test-seeded", global_context=ctx,
+        key_decisions=[], current_state="Active",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    incoming = MemoryCapsule(
+        topic="test-seeded", global_context=ctx,  # exact same
+        key_decisions=[], current_state="Testing PostGIS",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    result = ContextCompactorMiddleware._check_global_context_frozen(old, incoming)
+    assert result is False, "Exact match — must pass"
+
+
+def test_global_context_frozen_seeded_appended():
+    """Seeded capsule, global_context bi them 1 cau → reject."""
+    old = MemoryCapsule(
+        topic="test-seeded", global_context="KHÔNG làm thanh toán.",
+        key_decisions=[], current_state="Active",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    incoming = MemoryCapsule(
+        topic="test-seeded",
+        global_context="KHÔNG làm thanh toán. Sẽ xem xét sau khi đánh giá lại phạm vi.",  # APPENDED!
+        key_decisions=[], current_state="Testing",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    result = ContextCompactorMiddleware._check_global_context_frozen(old, incoming)
+    assert result is True, "Appended text — must reject"
+
+
+def test_global_context_frozen_seeded_disclaimer_removed():
+    """Seeded capsule, Disclaimer bi xoa → reject."""
+    old = MemoryCapsule(
+        topic="test-seeded",
+        global_context="Dự án parking. KHÔNG làm thanh toán. Disclaimer: prototype only.",
+        key_decisions=[], current_state="Active",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    incoming = MemoryCapsule(
+        topic="test-seeded",
+        global_context="Dự án parking. KHÔNG làm thanh toán.",  # Disclaimer bi mat!
+        key_decisions=[], current_state="Testing",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    result = ContextCompactorMiddleware._check_global_context_frozen(old, incoming)
+    assert result is True, "Disclaimer removed — must reject"
+
+
+def test_global_context_frozen_seeded_one_char_diff():
+    """Seeded capsule, global_context lệch 1 ký tự → reject."""
+    old = MemoryCapsule(
+        topic="test-seeded",
+        global_context="KHÔNG làm thanh toán trong phạm vi dự án.",
+        key_decisions=[], current_state="Active",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    incoming = MemoryCapsule(
+        topic="test-seeded",
+        global_context="KHÔNG làm thanh toán trong phạm vi dự an.",  # án -> an (thiếu dấu)
+        key_decisions=[], current_state="Testing",
+        metadata=CapsuleMetadata(seeded_by_kdm=True),
+    )
+    result = ContextCompactorMiddleware._check_global_context_frozen(old, incoming)
+    assert result is True, "1 char diff — must reject"
+
+
+def test_global_context_frozen_prompt_contains_rule():
+    """COMPACTOR_SYSTEM_PROMPT chua GLOBAL_CONTEXT FROZEN rule."""
+    from dcc_middleware import COMPACTOR_SYSTEM_PROMPT
+    assert "GLOBAL_CONTEXT FROZEN" in COMPACTOR_SYSTEM_PROMPT
+    assert "ABSOLUTELY FROZEN" in COMPACTOR_SYSTEM_PROMPT
+    assert "Do NOT summarize" in COMPACTOR_SYSTEM_PROMPT

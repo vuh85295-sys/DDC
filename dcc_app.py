@@ -408,6 +408,8 @@ def ingest_capsule(topic_id: str, capsule: MemoryCapsule):
     # Override topic field and reset frame to Turn 0
     capsule.topic = topic_id
     capsule.metadata.last_updated_frame = 0
+    # Mark as KDM-seeded: global_context becomes byte-frozen
+    capsule.metadata.seeded_by_kdm = True
 
     # Embed and save
     try:

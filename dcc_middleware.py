@@ -33,6 +33,7 @@ import chromadb
 class CapsuleMetadata(BaseModel):
     last_updated_frame: int = 0
     token_efficiency_saved: str = "0%"
+    seeded_by_kdm: bool = False
 
 
 class MemoryCapsule(BaseModel):
@@ -115,6 +116,7 @@ class VectorVault:
             documents=[capsule.to_json()],
             metadatas=[{"topic": capsule.topic,
                         "frame": capsule.metadata.last_updated_frame,
+                        "seeded": capsule.metadata.seeded_by_kdm,
                         "updated_at": time.time()}],
         )
 
@@ -155,6 +157,8 @@ Update existing values if they changed. Add new decisions.
 DECISION SOURCE RULE — CRITICAL: Only record a new key_decision when the USER turn contains an explicit decision, confirmation, or approval. Do NOT record the assistant's own analysis, explanations, or suggestions as decisions. If the user only asked a question or the assistant explained something without the user deciding, key_decisions must NOT gain new entries.
 
 NEGATION PRESERVATION — CRITICAL: When the assistant's response contains a refusal, prohibition, or negation (e.g., "không thể", "nằm ngoài phạm vi", "cấm", "không thuộc", "chưa"), you MUST preserve the negation in the capsule. Never compress "KHÔNG làm thanh toán" into "đã thêm thanh toán". The current_state and key_decisions must accurately reflect what was REFUSED, not what was added. If the assistant refused to implement something, the capsule must reflect that as a status of "refused", "outside scope", or "not implemented".
+
+GLOBAL_CONTEXT FROZEN — CRITICAL: The global_context field is ABSOLUTELY FROZEN for KDM-seeded capsules. You MUST copy it EXACTLY as-is from the EXISTING MEMORY CAPSULE. Do NOT summarize, rewrite, append, prepend, or modify it in any way — not even a single character. Only current_state and key_decisions may be updated.
 
 OUTPUT ONLY A VALID JSON OBJECT WITH THIS EXACT SCHEMA:
 {
@@ -279,6 +283,12 @@ class ContextCompactorMiddleware:
             self._log("[Immune v3] current_state contradicts LOCKED zone — rejecting")
             return self._fail_safe_merge(previous, prompt)
 
+        # Step 4.8: Byte-frozen global_context for KDM-seeded capsules
+        # global_context must be bytes-equal to previous (not even 1 char diff)
+        if self._check_global_context_frozen(previous, capsule):
+            self._log("[Immune v4] global_context changed on seeded capsule — rejecting")
+            return self._fail_safe_merge(previous, prompt)
+
         # Step 5: Write zones enforcement
         capsule = self._enforce_write_zones(previous, capsule)
         if capsule is None:
@@ -305,6 +315,18 @@ class ContextCompactorMiddleware:
         return capsule
 
     @staticmethod
+    def _check_global_context_frozen(previous: MemoryCapsule,
+                                     incoming: MemoryCapsule) -> bool:
+        """
+        For KDM-seeded capsules: global_context must be bytes-equal.
+        Returns True if violation (should reject capsule).
+        Organic capsules (not seeded) always pass.
+        """
+        if not previous.metadata.seeded_by_kdm:
+            return False  # organic capsule, skip check
+        return incoming.global_context != previous.global_context
+
+    @staticmethod
     def _enforce_write_zones(previous: MemoryCapsule,
                              incoming: MemoryCapsule) -> Optional[MemoryCapsule]:
         """
@@ -320,7 +342,9 @@ class ContextCompactorMiddleware:
             if '🔴' in old_dec and old_dec not in incoming.key_decisions:
                 return None  # signal: reject toan bo capsule
 
-        # LOCKED: restore original global_context
+        # LOCKED: restore original global_context (defense-in-depth)
+        # For seeded capsules, Step 4.8 already rejected any diff.
+        # For organic capsules, this maintains continuity.
         incoming.global_context = previous.global_context
 
         # GUARDED: append-only key_decisions
@@ -416,7 +440,7 @@ class ContextCompactorMiddleware:
         cs_lower = incoming.current_state.lower()
 
         # Scan for negation patterns in global_context (anti-map rules)
-        # Pattern: "KHÔNG làm X", "cấm X", "ngoài phạm vi: X"
+        # Pattern: "KHONG lam X", "cam X", "ngoai pham vi: X"
         neg_pattern = re.compile(
             r'(?:không|ko|chưa|cấm|ngoài\s+phạm\s+vi)[\s:;,]+(\w+(?:\s+\w+){0,5})',
             re.I,
