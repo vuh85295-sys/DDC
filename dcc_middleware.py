@@ -154,6 +154,8 @@ Update existing values if they changed. Add new decisions.
 
 DECISION SOURCE RULE — CRITICAL: Only record a new key_decision when the USER turn contains an explicit decision, confirmation, or approval. Do NOT record the assistant's own analysis, explanations, or suggestions as decisions. If the user only asked a question or the assistant explained something without the user deciding, key_decisions must NOT gain new entries.
 
+NEGATION PRESERVATION — CRITICAL: When the assistant's response contains a refusal, prohibition, or negation (e.g., "không thể", "nằm ngoài phạm vi", "cấm", "không thuộc", "chưa"), you MUST preserve the negation in the capsule. Never compress "KHÔNG làm thanh toán" into "đã thêm thanh toán". The current_state and key_decisions must accurately reflect what was REFUSED, not what was added. If the assistant refused to implement something, the capsule must reflect that as a status of "refused", "outside scope", or "not implemented".
+
 OUTPUT ONLY A VALID JSON OBJECT WITH THIS EXACT SCHEMA:
 {
   "topic": "String - Project/Topic Title",
@@ -260,6 +262,23 @@ class ContextCompactorMiddleware:
         if capsule is None:
             return self._fail_safe_merge(previous, prompt)
 
+        # Step 4.5: Full-capsule language net — check EVERY parsed field
+        if self._capsule_has_cjk(capsule):
+            self._log("[Immune v3] CJK in parsed capsule fields — rejecting")
+            return self._fail_safe_merge(previous, prompt)
+
+        # Step 4.6: Negation preservation check
+        # If the Actor refused X, the capsule must not say X was done
+        if not self._check_negation_preserved(clean_response, capsule):
+            self._log("[Immune v3] Negation lost in compaction — rejecting")
+            return self._fail_safe_merge(previous, prompt)
+
+        # Step 4.7: LOCKED contradiction check (FLUID semantic guard)
+        # current_state must not contradict the locked anti-map rules
+        if self._check_locked_contradiction(previous, capsule):
+            self._log("[Immune v3] current_state contradicts LOCKED zone — rejecting")
+            return self._fail_safe_merge(previous, prompt)
+
         # Step 5: Write zones enforcement
         capsule = self._enforce_write_zones(previous, capsule)
         if capsule is None:
@@ -314,6 +333,111 @@ class ContextCompactorMiddleware:
         incoming.key_decisions = existing
 
         return incoming
+
+    @staticmethod
+    def _capsule_has_cjk(capsule: MemoryCapsule) -> bool:
+        """Check ALL parsed capsule fields for CJK — full-capsule language net."""
+        fields = [
+            capsule.topic,
+            capsule.global_context,
+            capsule.current_state,
+            capsule.metadata.token_efficiency_saved,
+        ] + capsule.key_decisions
+        for field in fields:
+            if field and ContextCompactorMiddleware._has_cjk(field):
+                return True
+        return False
+
+    @staticmethod
+    def _check_negation_preserved(response: str,
+                                  new_capsule: MemoryCapsule) -> bool:
+        """
+        Check if the compactor preserved negation from the actor's response.
+        If the actor refused X, but the capsule says X was done -> violation.
+        """
+        resp_lower = response.lower()
+        cs_lower = new_capsule.current_state.lower()
+
+        # Refusal indicators to scan for
+        refusal_indicators = [
+            'không thể', 'không được', 'nằm ngoài phạm vi', 'cấm',
+            'không thuộc', 'không làm', 'chưa thể', 'chưa làm',
+            'cannot', 'outside scope', 'not in scope', 'not implemented',
+            'not part of', 'beyond scope',
+        ]
+
+        has_refusal = any(ind in resp_lower for ind in refusal_indicators)
+        if not has_refusal:
+            return True  # no refusal to preserve, OK
+
+        # There was a refusal — check if any refused concept appears
+        # in current_state WITHOUT preserved negation
+        # Scan words BOTH before and after the refusal indicator
+        for indicator in refusal_indicators:
+            idx = resp_lower.find(indicator)
+            while idx >= 0:
+                # Get context window around the refusal
+                ctx_start = max(0, idx - 60)
+                ctx_end = min(len(resp_lower),
+                              idx + len(indicator) + 60)
+                context = resp_lower[ctx_start:ctx_end]
+                # Extract all meaningful words (3+ chars) from context
+                words = set(re.findall(r'\b\w{3,}\b', context))
+
+                # Check if these words appear in current_state
+                for word in words:
+                    if word in cs_lower:
+                        pos = cs_lower.find(word)
+                        window = cs_lower[
+                            max(0, pos - 25):pos + len(word) + 25
+                        ]
+                        # If concept appears WITHOUT negation -> violation
+                        if not any(
+                            n in window
+                            for n in ['không', 'chưa', 'cấm',
+                                      'ngoài phạm vi', 'không phải']
+                        ):
+                            return False
+                # Look for next occurrence of this indicator
+                idx = resp_lower.find(indicator, idx + 1)
+                if idx == -1:
+                    break
+
+        return True
+
+    @staticmethod
+    def _check_locked_contradiction(previous: MemoryCapsule,
+                                    incoming: MemoryCapsule) -> bool:
+        """
+        FLUID semantic guard: check if current_state contradicts LOCKED zone.
+        Returns True if violation detected (should reject capsule).
+        """
+        gc_lower = previous.global_context.lower()
+        cs_lower = incoming.current_state.lower()
+
+        # Scan for negation patterns in global_context (anti-map rules)
+        # Pattern: "KHÔNG làm X", "cấm X", "ngoài phạm vi: X"
+        neg_pattern = re.compile(
+            r'(?:không|ko|chưa|cấm|ngoài\s+phạm\s+vi)[\s:;,]+(\w+(?:\s+\w+){0,5})',
+            re.I,
+        )
+        for match in neg_pattern.finditer(gc_lower):
+            restricted = match.group(1).strip()
+            if not restricted:
+                continue
+            terms = set(re.findall(r'\b\w{2,}\b', restricted))
+            for term in terms:
+                if term in cs_lower:
+                    pos = cs_lower.find(term)
+                    window = cs_lower[
+                        max(0, pos - 20):pos + len(term) + 20
+                    ]
+                    if not re.search(
+                        r'\b(không|chưa|đừng|cấm|ngoài phạm vi|không phải)\b',
+                        window, re.I,
+                    ):
+                        return True  # violation
+        return False
 
     @staticmethod
     def _has_cjk(text: str) -> bool:

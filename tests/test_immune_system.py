@@ -378,3 +378,159 @@ def test_decision_source_filter_no_new_from_explanation():
     # key_decisions không được thêm mục mới
     assert len(result.key_decisions) == 1
     assert result.key_decisions == ["PostGIS làm database không gian"]
+
+
+# ---------------------------------------------------------------------------
+# v3: Full-capsule language net — check parsed fields individually
+# ---------------------------------------------------------------------------
+
+def test_capsule_has_cjk_topic():
+    """CJK trong topic → True."""
+    cap = MemoryCapsule(topic="测试", global_context="OK", current_state="OK")
+    assert ContextCompactorMiddleware._capsule_has_cjk(cap) is True
+
+
+def test_capsule_has_cjk_global_context():
+    """CJK trong global_context → True."""
+    cap = MemoryCapsule(
+        topic="test", global_context="项目背景", current_state="OK",
+    )
+    assert ContextCompactorMiddleware._capsule_has_cjk(cap) is True
+
+
+def test_capsule_has_cjk_current_state():
+    """CJK trong current_state → True."""
+    cap = MemoryCapsule(
+        topic="test", global_context="OK",
+        current_state="正在测试",
+    )
+    assert ContextCompactorMiddleware._capsule_has_cjk(cap) is True
+
+
+def test_capsule_has_cjk_key_decisions():
+    """CJK trong key_decisions → True."""
+    cap = MemoryCapsule(
+        topic="test", global_context="OK", current_state="OK",
+        key_decisions=["PostGIS", "地理空间数据库"],
+    )
+    assert ContextCompactorMiddleware._capsule_has_cjk(cap) is True
+
+
+def test_capsule_has_cjk_clean():
+    """Không CJK → False."""
+    cap = MemoryCapsule(
+        topic="test", global_context="Clean project", current_state="Active",
+    )
+    assert ContextCompactorMiddleware._capsule_has_cjk(cap) is False
+
+
+# ---------------------------------------------------------------------------
+# v3: Negation preservation check
+# ---------------------------------------------------------------------------
+
+def test_negation_preserved_no_refusal():
+    """Không có refusal → OK."""
+    resp = "PostGIS is a spatial extension for PostgreSQL."
+    cap = MemoryCapsule(topic="test", global_context="OK",
+                        current_state="Explained database setup")
+    assert ContextCompactorMiddleware._check_negation_preserved(resp, cap) is True
+
+
+def test_negation_preserved_refusal_ok():
+    """Actor refused, capsule preserves negation → OK."""
+    resp = "Payment integration is khong trong phạm vi của dự án này."
+    cap = MemoryCapsule(topic="test", global_context="OK",
+                        current_state="Ngoài phạm vi — không làm thanh toán")
+    assert ContextCompactorMiddleware._check_negation_preserved(resp, cap) is True
+
+
+def test_negation_preserved_refusal_lost():
+    """Actor refused, capsule says it was done → violation."""
+    resp = "Thanh toán nằm ngoài phạm vi của dự án."
+    cap = MemoryCapsule(topic="test", global_context="OK",
+                        current_state="Đã thêm thanh toán")  # FALSE!
+    assert ContextCompactorMiddleware._check_negation_preserved(resp, cap) is False
+
+
+def test_negation_preserved_english_refusal():
+    """Refusal in English → preserved OK."""
+    resp = "Payment is outside scope of this project."
+    cap = MemoryCapsule(topic="test", global_context="OK",
+                        current_state="Outside scope — không thêm payment")
+    assert ContextCompactorMiddleware._check_negation_preserved(resp, cap) is True
+
+
+def test_negation_preserved_english_refusal_lost():
+    """Refusal in English, capsule says done → violation."""
+    resp = "Payment integration is not in scope."
+    cap = MemoryCapsule(topic="test", global_context="OK",
+                        current_state="Payment integration completed")  # FALSE!
+    assert ContextCompactorMiddleware._check_negation_preserved(resp, cap) is False
+
+
+# ---------------------------------------------------------------------------
+# v3: FLUID semantic guard — LOCKED contradiction check
+# ---------------------------------------------------------------------------
+
+def test_locked_contradiction_clean():
+    """Không có contradiction → OK (trả False)."""
+    old = _make_capsule(
+        global_context="Dự án parking — KHÔNG làm thanh toán. Ngoài phạm vi: booking.",
+        key_decisions=["PostGIS", "WebSockets"],
+        current_state="Testing PostGIS queries",
+    )
+    incoming = _make_capsule(
+        global_context="sẽ bị LOCKED ghi đè",
+        key_decisions=["PostGIS"],
+        current_state="Đang test PostGIS queries với 1000 spot",
+    )
+    result = ContextCompactorMiddleware._check_locked_contradiction(old, incoming)
+    assert result is False, "Không contradiction — phải OK"
+
+
+def test_locked_contradiction_detected():
+    """current_state nói 'đã thêm thanh toán' trong khi LOCKED cấm → violation."""
+    old = _make_capsule(
+        global_context="Dự án parking — KHÔNG làm thanh toán.",
+        key_decisions=["PostGIS"],
+        current_state="Active",
+    )
+    incoming = _make_capsule(
+        global_context="bỏ qua",
+        key_decisions=["PostGIS"],
+        current_state="Đã thêm thanh toán và booking",  # CONTRADICTION!
+    )
+    result = ContextCompactorMiddleware._check_locked_contradiction(old, incoming)
+    assert result is True, "thanh toán bị cấm nhưng current_state nói đã thêm"
+
+
+def test_locked_contradiction_with_negation():
+    """current_state nhắc đến thanh toán nhưng kèm phủ định → OK."""
+    old = _make_capsule(
+        global_context="Dự án parking — KHÔNG làm thanh toán.",
+        key_decisions=["PostGIS"],
+        current_state="Active",
+    )
+    incoming = _make_capsule(
+        global_context="bỏ qua",
+        key_decisions=["PostGIS"],
+        current_state="Không thêm thanh toán — ngoài phạm vi",  # negation saved
+    )
+    result = ContextCompactorMiddleware._check_locked_contradiction(old, incoming)
+    assert result is False, "Negation preserved — phải OK"
+
+
+def test_locked_contradiction_multiple_rules():
+    """Nhiều anti-map rules, 1 cái bị vi phạm -> violation."""
+    old = _make_capsule(
+        global_context="Dự án parking — KHÔNG thanh toán. Cấm booking. Ngoài phạm vi: user auth.",
+        key_decisions=["PostGIS"],
+        current_state="Active",
+    )
+    incoming = _make_capsule(
+        global_context="bỏ qua",
+        key_decisions=["PostGIS"],
+        current_state="Đã deploy auth system với JWT",  # VIOLATION: auth
+    )
+    result = ContextCompactorMiddleware._check_locked_contradiction(old, incoming)
+    assert result is True, "Auth bị cấm nhưng current_state nói đã deploy"
